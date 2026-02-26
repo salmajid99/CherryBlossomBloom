@@ -1,0 +1,450 @@
+---
+title: "Cherry Blossom Peak Bloom Prediction (2026)"
+author: "Suhail Almajid"
+date: "2026-02-26"
+output: pdf_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+Libraries
+---------
+
+This analysis uses the tidyverse ecosystem for data manipulation and visualization. The lubridate package is used for working with dates, while purrr supports data wrangling, reshaping, and iteration across locations.
+
+```{r}
+library(tidyverse)
+library(lubridate)
+library(purrr)
+```
+
+Load and combine historical bloom data
+--------------------------------------
+
+Historical cherry blossom peak bloom data were loaded for five locations and combined into a single dataset. The data include bloom timing by year and location, allowing for both cross-location and temporal analysis. Summary checks are performed to confirm that data from all locations were successfully merged and to inspect the most recent observations.
+
+```{r}
+cherry <- read_csv("data/washingtondc.csv") |>
+  bind_rows(read_csv("data/liestal.csv")) |>
+  bind_rows(read_csv("data/kyoto.csv")) |>
+  bind_rows(read_csv("data/vancouver.csv")) |>
+  bind_rows(read_csv("data/nyc.csv"))
+
+cherry |> count(location)
+cherry |> group_by(location) |> slice_tail(n = 3)
+```
+
+Load and standardize 2026 forecast temperature data
+---------------------------------------------------
+Daily temperature forecasts for 2026 were loaded from the AccuWeather dataset and prepared for analysis. Location names were standardized to match those used in the historical bloom and temperature datasets, ensuring consistency across data sources. A summary count by location is used to verify that all five locations are present in the forecast data. This standardization step prevents mismatches when joining or predicting across datasets.
+
+```{r}
+forecast_2026 <- read_csv("data/accuweather_forecast_2026.csv") |>
+  mutate(date = as.Date(date)) |>
+  mutate(location = case_when(
+    location == "newyork" ~ "newyorkcity",
+    location == "washington" ~ "washingtondc",
+    TRUE ~ location
+  ))
+
+forecast_2026 |> count(location)
+```
+
+Construct January–March temperature features for 2026
+-----------------------------------------------------
+
+Daily temperature forecasts for January through March 2026 were aggregated into monthly average temperatures for each location. These monthly averages serve as predictors in the regression model and are constructed to match the structure of the historical temperature features used during model training. The resulting dataset contains one row per location with January, February, and March average temperatures for 2026.
+
+```{r}
+temp_2026_features <- forecast_2026 |>
+  mutate(month = month(date)) |>
+  filter(month %in% 1:3) |>
+  group_by(location, month) |>
+  summarize(avg_temp = mean(temp, na.rm = TRUE), .groups = "drop") |>
+  pivot_wider(names_from = month, values_from = avg_temp,
+              names_prefix = "avg_temp_m") |>
+  mutate(year = 2026)
+
+temp_2026_features
+```
+
+Define NOAA station IDs per location
+------------------------------------
+
+To create historical temperature predictors, one representative NOAA GHCN-Daily weather station was selected for each location. These station IDs provide consistent daily temperature records over multiple decades. Using a single station per location keeps the model simple while capturing year-to-year weather variation.
+
+```{r}
+stations <- c(
+  washingtondc = "GHCND:USW00013743",
+  vancouver    = "GHCND:CA001108395",
+  newyorkcity  = "GHCND:USW00014732",
+  liestal      = "GHCND:SZ000001940",
+  kyoto        = "GHCND:JA000047759"
+)
+```
+
+Function to compute Jan–Mar average temperatures by year
+--------------------------------------------------------
+
+A helper function was written to download daily weather data for a given station from NOAA’s public GHCN-Daily archive and convert it into model-ready features. Daily mean temperature is computed as the average of daily maximum and minimum temperature, converting NOAA’s tenths-of-degrees Celsius units into degrees Celsius. The function then summarizes January, February, and March into yearly monthly averages and returns one row per year with these predictors.
+
+```{r}
+get_jfm_features <- function(station_id, start_year, end_year) {
+
+  # Strip "GHCND:" prefix if present
+  station_id <- gsub("GHCND:", "", station_id)
+
+  url <- paste0(
+    "https://www.ncei.noaa.gov/data/global-historical-climatology-network-daily/access/",
+    station_id, ".csv"
+  )
+
+  dat <- readr::read_csv(url, show_col_types = FALSE)
+
+  dat <- dat |>
+    mutate(
+      DATE  = as.Date(DATE),
+      year  = lubridate::year(DATE),
+      month = lubridate::month(DATE)
+    ) |>
+    filter(year >= start_year,
+           year <= end_year,
+           month %in% 1:3)
+
+  # NOAA temps are in tenths of °C
+  dat <- dat |>
+    mutate(
+      temp_c = (TMAX + TMIN) / 20
+    )
+
+  dat |>
+    group_by(year, month) |>
+    summarize(avg_temp_c = ifelse(all(is.na(temp_c)), NA_real_, mean(temp_c, na.rm = TRUE)), .groups="drop") |>
+    tidyr::pivot_wider(
+      names_from = month,
+      values_from = avg_temp_c,
+      names_prefix = "avg_temp_m"
+    )
+}
+```
+
+Build historical temperature features for all locations
+-------------------------------------------------------
+
+Historical temperature features were constructed for each location by applying the January–March aggregation function across all selected NOAA stations. For each year and location, the resulting dataset contains average temperatures for January, February, and March, which serve as predictors in the regression model. The combined feature table was inspected to confirm successful construction and consistent structure across locations.
+
+```{r}
+start_year <- 1950
+end_year   <- 2025
+
+temp_features_hist <- imap_dfr(stations, \(station_id, loc) {
+  get_jfm_features(station_id, start_year, end_year) |>
+    mutate(location = loc)
+})
+
+temp_features_hist |> glimpse()
+```
+
+Rebuild temperature features
+----------------------------
+
+Historical temperature features were generated by looping over the list of NOAA stations and stacking the results into one dataset. Warnings were suppressed during this step to keep the report output readable, since occasional missing values or incomplete station records can produce expected warnings when computing monthly averages.
+
+```{r, warning = F}
+temp_features_hist <- imap_dfr(stations, \(station_id, loc) {
+  get_jfm_features(station_id, start_year, end_year) |>
+    mutate(location = loc)
+})
+```
+
+Sanity checks on the constructed features
+-----------------------------------------
+
+Several quality checks were performed to verify the temperature feature table. Counts by location confirm that each site contributes multiple years of data, while summary statistics provide a quick range check for winter temperatures. A small subset of rows for Washington, DC was also printed to visually confirm the feature columns and year alignment.
+
+```{r}
+temp_features_hist |> count(location)
+
+summary(temp_features_hist[, c("avg_temp_m1", "avg_temp_m2", "avg_temp_m3")])
+
+temp_features_hist |> filter(location == "washingtondc") |> head()
+```
+
+Load and standardize historical bloom data
+------------------------------------------
+
+Historical cherry blossom peak bloom data were loaded for each location and combined into a single dataset. Location names were explicitly standardized at import time to ensure consistency with the historical temperature features and the 2026 forecast data. The combined dataset was inspected to confirm that all expected variables were present before model training.
+
+```{r}
+dc  <- readr::read_csv("data/washingtondc.csv", show_col_types = FALSE) |> mutate(location = "washingtondc")
+nyc <- readr::read_csv("data/nyc.csv", show_col_types = FALSE) |> mutate(location = "newyorkcity")
+van <- readr::read_csv("data/vancouver.csv", show_col_types = FALSE) |> mutate(location = "vancouver")
+lie <- readr::read_csv("data/liestal.csv", show_col_types = FALSE) |> mutate(location = "liestal")
+kyo <- readr::read_csv("data/kyoto.csv", show_col_types = FALSE) |> mutate(location = "kyoto")
+
+bloom <- bind_rows(dc, nyc, van, lie, kyo)
+names(bloom)
+```
+Construct the model training dataset
+------------------------------------
+
+The model training dataset was created by joining historical bloom timing data with the corresponding January–March temperature features by location and year. Observations with missing bloom dates or temperature predictors were removed to ensure a complete-case analysis. Counts by location were examined to confirm adequate historical coverage for each site.
+
+```{r}
+training <- bloom |>
+  inner_join(temp_features_hist, by = c("location", "year")) |>
+  drop_na(bloom_doy, avg_temp_m1, avg_temp_m2, avg_temp_m3)
+
+training |> count(location)
+```
+Fit the linear regression model
+-------------------------------
+
+A linear regression model was fit to predict peak bloom day-of-year using average January, February, and March temperatures along with a categorical location effect. Including location as a factor allows the model to account for systematic differences in bloom timing across sites while temperature predictors capture year-to-year climatic variation. Model summary statistics indicate strong overall explanatory power and statistically significant effects for late-winter and early-spring temperatures.
+
+```{r}
+model <- lm(
+  bloom_doy ~ avg_temp_m1 + avg_temp_m2 + avg_temp_m3 + location,
+  data = training
+)
+
+summary(model)
+```
+Prepare 2026 temperature predictors for forecasting
+---------------------------------------------------
+
+Daily temperature forecasts for January through March 2026 were processed into monthly average temperature predictors for each location. These predictors were constructed using the same aggregation approach as the historical temperature features to ensure compatibility with the trained regression model. The resulting dataset contains one observation per location and serves as the input for generating 2026 bloom predictions.
+
+
+```{r}
+forecast_2026 <- read_csv("data/accuweather_forecast_2026.csv", show_col_types = FALSE) |>
+  mutate(date = as.Date(date)) |>
+  mutate(location = case_when(
+    location == "newyork" ~ "newyorkcity",
+    location == "washington" ~ "washingtondc",
+    TRUE ~ location
+  ))
+
+temp_2026_features <- forecast_2026 |>
+  mutate(month = lubridate::month(date)) |>
+  filter(month %in% 1:3) |>
+  group_by(location, month) |>
+  summarize(avg_temp_c = mean(temp, na.rm = TRUE), .groups = "drop") |>
+  pivot_wider(names_from = month, values_from = avg_temp_c, names_prefix = "avg_temp_m") |>
+  mutate(year = 2026)
+
+temp_2026_features
+```
+Generate 2026 bloom predictions
+-------------------------------
+
+The fitted regression model was used to predict peak bloom day-of-year for each location using the 2026 temperature predictors. Predicted values were converted from day-of-year to calendar dates to provide an interpretable estimate of peak bloom timing. These initial predictions retain the continuous output of the linear regression model.
+
+```{r}
+pred_doy_2026 <- predict(model, newdata = temp_2026_features)
+
+predictions_2026 <- temp_2026_features |>
+  mutate(pred_bloom_doy = as.numeric(pred_doy_2026)) |>
+  mutate(pred_bloom_date = as.Date(pred_bloom_doy - 1, origin = "2026-01-01")) |>
+  select(location, pred_bloom_date, pred_bloom_doy)
+
+predictions_2026
+```
+
+Finalize predictions
+--------------------
+
+Predicted bloom day-of-year values were rounded to the nearest whole day to reflect the discrete nature of calendar dates. Final bloom dates were recomputed using the rounded values and organized by location to produce the final set of predictions for submission. These results represent the model’s best estimate of peak cherry blossom bloom timing for spring 2026.
+
+```{r}
+predictions_2026_final <- predictions_2026 |>
+  mutate(pred_bloom_doy = as.integer(round(pred_bloom_doy))) |>
+  mutate(pred_bloom_date = as.Date(pred_bloom_doy - 1, origin = "2026-01-01")) |>
+  arrange(location)
+
+predictions_2026_final
+```
+
+Random Forest Model
+-------------------
+
+```{r}
+library(ranger)
+
+base_temp_c <- 5
+gdd_cutoffs <- c(30, 60, 90, 105, 120)
+```
+
+```{r}
+get_gdd_features_station <- function(station_id, start_year, end_year,
+                                     base_temp_c = 5, cutoffs = c(30,60,90,105,120)) {
+
+  station_id <- gsub("GHCND:", "", station_id)
+
+  url <- paste0(
+    "https://www.ncei.noaa.gov/data/global-historical-climatology-network-daily/access/",
+    station_id, ".csv"
+  )
+
+  dat <- readr::read_csv(url, show_col_types = FALSE)
+
+  # Ensure required columns exist
+  required_cols <- c("DATE", "TMAX", "TMIN")
+  missing_cols <- setdiff(required_cols, names(dat))
+  if (length(missing_cols) > 0) {
+    stop("Missing columns in NOAA file for station ", station_id, ": ",
+         paste(missing_cols, collapse = ", "))
+  }
+
+  dat <- dat |>
+    mutate(
+      DATE = as.Date(DATE),
+      year = lubridate::year(DATE),
+      # force numeric in case parsing issues created characters
+      TMAX = suppressWarnings(as.numeric(TMAX)),
+      TMIN = suppressWarnings(as.numeric(TMIN)),
+      temp_c = (TMAX + TMIN) / 20,
+      gdd = pmax(0, temp_c - base_temp_c)
+    ) |>
+    filter(year >= start_year, year <= end_year) |>
+    arrange(year, DATE)
+
+  # Compute cumulative GDD by year
+  dat <- dat |>
+    group_by(year) |>
+    mutate(cum_gdd = cumsum(replace_na(gdd, 0))) |>
+    ungroup()
+
+  # Summarize using DATE cutoffs instead of doy
+  out <- purrr::map_dfr(cutoffs, function(k) {
+    dat |>
+      group_by(year) |>
+      filter(DATE <= as.Date(paste0(year, "-01-01")) + (k - 1)) |>
+      summarize(val = if (n() == 0) NA_real_ else tail(cum_gdd, 1), .groups = "drop") |>
+      rename(!!paste0("gdd_", k) := val)
+  })
+
+  # `out` is stacked by cutoff; we need one row per year
+  # Combine by year using left joins
+  out_final <- out |>
+    group_by(year) |>
+    summarize(across(starts_with("gdd_"), ~ dplyr::first(.x)), .groups = "drop")
+
+  out_final
+}
+```
+
+```{r}
+gdd_features_hist <- purrr::imap_dfr(stations, \(station_id, loc) {
+  get_gdd_features_station(
+    station_id = station_id,
+    start_year = start_year,
+    end_year   = end_year,
+    base_temp_c = base_temp_c,
+    cutoffs = gdd_cutoffs
+  ) |>
+    mutate(location = loc)
+})
+
+gdd_features_hist |> count(location)
+```
+
+```{r}
+training_rf <- bloom |>
+  inner_join(gdd_features_hist, by = c("location", "year")) |>
+  drop_na(bloom_doy)
+
+training_rf |> count(location)
+```
+
+```{r}
+set.seed(1)
+
+rf_model <- ranger::ranger(
+  formula = bloom_doy ~ location + gdd_30 + gdd_60 + gdd_90 + gdd_105 + gdd_120,
+  data = training_rf,
+  num.trees = 1000,
+  importance = "permutation"
+)
+
+rf_model
+rf_model$prediction.error  # OOB MSE (lower is better)
+rf_model$variable.importance
+```
+
+```{r}
+# helper: last cumulative value up to cutoff k (within one location group)
+last_cum_to <- function(doy_vec, cum_vec, k) {
+  idx <- which(doy_vec <= k)
+  if (length(idx) == 0) return(NA_real_)
+  cum_vec[max(idx)]
+}
+
+gdd_2026_features <- forecast_2026 |>
+  mutate(
+    date = as.Date(date),
+    year = 2026,
+    doy  = lubridate::yday(date),
+    temp_c = temp,
+    gdd = pmax(0, temp_c - base_temp_c)
+  ) |>
+  filter(doy <= max(gdd_cutoffs)) |>
+  arrange(location, date) |>
+  group_by(location) |>
+  mutate(cum_gdd = cumsum(replace_na(gdd, 0))) |>
+  summarize(
+    year = 2026,
+    gdd_30  = last_cum_to(doy, cum_gdd, 30),
+    gdd_60  = last_cum_to(doy, cum_gdd, 60),
+    gdd_90  = last_cum_to(doy, cum_gdd, 90),
+    gdd_105 = last_cum_to(doy, cum_gdd, 105),
+    gdd_120 = last_cum_to(doy, cum_gdd, 120),
+    .groups = "drop"
+  )
+
+gdd_2026_features
+```
+
+```{r}
+rf_pred_2026 <- predict(rf_model, data = gdd_2026_features)$predictions
+
+predictions_2026_rf <- gdd_2026_features |>
+  mutate(pred_bloom_doy = as.integer(round(rf_pred_2026))) |>
+  mutate(pred_bloom_date = as.Date(pred_bloom_doy - 1, origin = "2026-01-01")) |>
+  select(location, pred_bloom_date, pred_bloom_doy) |>
+  arrange(location)
+
+predictions_2026_rf
+```
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
